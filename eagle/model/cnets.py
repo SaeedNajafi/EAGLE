@@ -472,6 +472,7 @@ class Model(nn.Module):
     def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0):
         super().__init__()
 
+        self.config = config
         self.gradient_checkpointing = True
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -512,7 +513,10 @@ class Model(nn.Module):
         self.act = ACT2FN[config.hidden_act]
         self.logsoftmax = nn.LogSoftmax(dim=-1)
         for param in self.embed_tokens.parameters():
-            param.requires_grad = False
+            if config.train_em_table:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
     def init_tree(self):
         self.tree_mask_init = torch.eye(self.top_k, device=self.embed_tokens.weight.device)[None, None]
@@ -572,7 +576,8 @@ class Model(nn.Module):
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
-        with torch.no_grad():
+        # with torch.no_grad():
+        with torch.set_grad_enabled(self.config.train_em_table):
             inputs_embeds = self.embed_tokens(input_ids)
             # inputs_embeds = inputs_embeds.detach()
 

@@ -3,8 +3,12 @@ import argparse
 parser = argparse.ArgumentParser(description='sp')
 parser.add_argument('--basepath', type=str, default='/home/lyh/weights/hf/vicuna_v13/7B/')
 parser.add_argument('--configpath', type=str, default="config.json")
+parser.add_argument('--run_name', type=str, default="original_eagle_v1_one_layer")
 parser.add_argument('--lr', type=float, default=3e-5)
 parser.add_argument('--bs', type=int, default=4)
+parser.add_argument('--num_hidden_layers', type=int, default=1)
+parser.add_argument('--add_next_token_loss', type=str, default="yes")
+parser.add_argument('--train_lm_head_em_table', type=str, default="no")
 parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
 parser.add_argument('--tmpdir', type=str, default='0')
 parser.add_argument('--cpdir', type=str, default='0')
@@ -22,6 +26,7 @@ train_config = {
     "total_steps": 800000,
     "p_w": 0.1,
     "v_w": 1.0,
+    "next_token_w": 0.1,
     "head_w": 0.1,
     "num_workers": 2,
     "embeding": True,
@@ -67,11 +72,15 @@ from transformers import get_linear_schedule_with_warmup, AutoConfig
 if accelerator.is_main_process:
     import wandb
 
-    wandb.init(project="ess", entity="yuhui-li", config=train_config)
+    wandb.init(project="eagle_mamba_offline_research_h100",
+               group="Eagle_for_Llama-3.1-8B-Instruct",
+               name=args.run_name,
+               config=train_config)
 
 baseconfig = AutoConfig.from_pretrained(args.basepath)
 
-head = torch.nn.Linear(baseconfig.hidden_size, baseconfig.vocab_size, bias=False)
+teacher_head = torch.nn.Linear(baseconfig.hidden_size, baseconfig.vocab_size, bias=False)
+student_head = torch.nn.Linear(baseconfig.hidden_size, baseconfig.vocab_size, bias=False)
 
 try:
     with open(os.path.join(args.basepath, "model.safetensors.index.json"), "r") as f:
@@ -83,18 +92,43 @@ try:
         tensor_slice = f.get_slice("lm_head.weight")
         vocab_size, hidden_dim = tensor_slice.get_shape()
         tensor = tensor_slice[:, :hidden_dim].float()
-except:
+except Exception as e:
+    print(e)
     with open(os.path.join(args.basepath, "pytorch_model.bin.index.json"), "r") as f:
         index_json = json.loads(f.read())
         head_path = index_json["weight_map"]["lm_head.weight"]
     weights = torch.load(os.path.join(args.basepath, head_path))
     tensor = weights["lm_head.weight"].float()
 
-head.weight.data = tensor
-head.eval()
+student_head.weight.data = tensor
+student_head.eval()
 
-for param in head.parameters():
+teacher_head.weight.data = tensor
+teacher_head.eval()
+
+for param in teacher_head.parameters():
     param.requires_grad = False
+
+if args.train_lm_head_em_table == "yes":
+    for param in student_head.parameters():
+        param.requires_grad = True
+else:
+    for param in student_head.parameters():
+        param.requires_grad = False
+
+def print_model_size(model: torch.nn.Module, model_path: str) -> None:
+    """Print model name, the number of trainable parameters and initialization
+    time.
+
+    Args:
+        model: The PyTorch model.
+        model_path: name or path for model.
+    """
+    print(f"--> Model {model_path}")
+    total_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"--> {model_path} has {total_trainable_params / 1e6} Million params to train.")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"--> {model_path} has {total_params / 1e6} Million params in total.")
 
 
 def list_files(path):
@@ -228,18 +262,55 @@ def top_accuracy(output, target, topk=(1,)):
             res.append(correct_k)
         return res
 
-def compute_loss(target, target_p, predict, loss_mask):
-    out_head = head(predict)
+def log_of_labels(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    loss_func: torch.nn.CrossEntropyLoss,
+) -> torch.Tensor:
+    """Compute the actual log of labels given pre-computed logits.
+
+    This function is also useful for both Roberta model and getting
+    generation logits for sampling methods.
+    """
+    log_p = -loss_func(
+        logits.view(-1, logits.size(-1)),
+        labels.view(-1),
+    )
+
+    batch_size, sequence_length, vocab_size = logits.size()
+
+    # compute per-token log probability in a sequence.
+    log_p = log_p.view(batch_size, sequence_length)
+
+    # non-masked tokens have index -100 in huggingface.
+    good_log_p = log_p.masked_fill(labels == -100, 0.0)
+
+    # good_log_p now has the log probability of the output
+    # sequence tokens corresponding to the labels at the [MASK] location.
+    return torch.sum(good_log_p, dim=1)
+
+next_token_func = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+
+def compute_loss(target, target_p, predict, loss_mask, input_ids):
+    out_head = student_head(predict)
+    next_token_loss = torch.tensor([0.0])
+    if args.add_next_token_loss == "yes":
+        labels = input_ids.masked_fill(loss_mask.squeeze(2) == 0, -100)
+        # Shift so that tokens < n predict n
+        shift_logits = out_head[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        next_token_loss = -torch.mean(log_of_labels(shift_logits, shift_labels, next_token_func))
+
     out_logp = nn.LogSoftmax(dim=2)(out_head)
     plogp = target_p * out_logp
     ploss = -torch.sum(torch.sum(loss_mask * plogp, 2)) / (loss_mask.sum() + 1e-5)
     vloss = criterion(predict, target)
     vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.sum() + 1e-5)
-    return vloss, ploss, out_head
+    return vloss, ploss, out_head, next_token_loss
 
 @torch.no_grad()
-def getkacc(model, data, head, max_length=5):
-    def generate(hidden_states, input_ids, head, max_length=4, use_cache=True):
+def getkacc(model, data, max_length=5):
+    def generate(hidden_states, input_ids, max_length=4, use_cache=True):
         if use_cache:
             past_key_values = None
             for i in range(max_length):
@@ -249,7 +320,7 @@ def getkacc(model, data, head, max_length=5):
                 else:
                     out_hidden, past_key_values = model(hidden_states, input_ids=input_ids, use_cache=True)
                 last_hidden = out_hidden[:, -1:]
-                last_headout = head(last_hidden)
+                last_headout = student_head(last_hidden)
                 token = torch.argmax(last_headout, dim=-1)
                 input_ids = torch.cat((input_ids, token), dim=1)
 
@@ -265,7 +336,7 @@ def getkacc(model, data, head, max_length=5):
     total = [0 for _ in range(max_length)]
     correct = [0 for _ in range(max_length)]
     bs, seq_len = hidden_states.shape[0], hidden_states.shape[1]
-    target_headout = head(target)
+    target_headout = teacher_head(target)
     target_ids = target_headout.argmax(dim=2)
 
     for pre_len in range(1, seq_len):
@@ -273,7 +344,7 @@ def getkacc(model, data, head, max_length=5):
             continue
         pre_hidden_states = hidden_states[:, :pre_len]
         pre_input_ids = input_ids[:, :pre_len]
-        outs = generate(pre_hidden_states, pre_input_ids, head, max_length=max_length)
+        outs = generate(pre_hidden_states, pre_input_ids, max_length=max_length)
         generate_ids = outs[:, pre_len:]
         for bid in range(bs):
             for k in range(max_length):
@@ -319,10 +390,27 @@ if accelerator.is_main_process:
         os.makedirs(args.cpdir)
 
 config = EConfig.from_pretrained(train_config["config_path"])
+
+config.update({"num_hidden_layers": args.num_hidden_layers})
+if args.train_lm_head_em_table == "yes":
+    config.update({"train_em_table": True})
+else:
+    config.update({"train_em_table": False})
+
+print("Eagle config:\n")
+print(config)
+print("\n")
+
 model = Model(config, load_emb=True, path=args.basepath)
 
+print_model_size(model, args.basepath)
+
 criterion = nn.SmoothL1Loss(reduction="none")
-optimizer = optim.AdamW(model.parameters(), lr=train_config["lr"], betas=(train_config["b1"], train_config["b2"]))
+parameters = list(model.parameters())
+if args.train_lm_head_em_table == "yes":
+    parameters += list(student_head.parameters())
+
+optimizer = optim.AdamW(parameters, lr=train_config["lr"], betas=(train_config["b1"], train_config["b2"]))
 
 num_epochs = train_config["num_epochs"]
 num_warmup_steps = train_config["num_warmup_steps"]
@@ -333,12 +421,12 @@ if is_warmup:
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps,
                                                 num_training_steps=total_steps)
 
-    model, head, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
-        model, head, optimizer, train_loader, test_loader, scheduler
+    model, teacher_head, student_head, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
+        model, teacher_head, student_head, optimizer, train_loader, test_loader, scheduler
     )
 else:
-    model, head, optimizer, train_loader, test_loader = accelerator.prepare(
-        model, head, optimizer, train_loader, test_loader
+    model, teacher_head, student_head, optimizer, train_loader, test_loader = accelerator.prepare(
+        model, teacher_head, student_head, optimizer, train_loader, test_loader
     )
 # accelerator.load_state("checkpoints/state_5")
 for epoch in range(num_epochs + 1):
@@ -354,15 +442,17 @@ for epoch in range(num_epochs + 1):
             optimizer.zero_grad()
             predict = model(data["hidden_states"], input_ids=data["input_ids"], attention_mask=data["attention_mask"])
             with torch.no_grad():
-                target_head = head(data["target"])
+                target_head = teacher_head(data["target"])
                 target_p = nn.Softmax(dim=2)(target_head)
                 target_p = target_p.detach()
             loss_mask = data["loss_mask"][:, :, None]
-            vloss, ploss, out_head = compute_loss(data["target"], target_p, predict, loss_mask)
+            vloss, ploss, out_head, next_token_loss = compute_loss(data["target"], target_p, predict, loss_mask, data["input_ids"])
             loss = train_config["v_w"] * vloss + train_config["p_w"] * ploss
+            if args.add_next_token_loss == "yes":
+                loss += train_config["next_token_w"] * next_token_loss
             # loss.backward()
             accelerator.backward(loss)
-            accelerator.clip_grad_value_(model.parameters(), train_config["grad_clip"])
+            accelerator.clip_grad_value_(parameters, train_config["grad_clip"])
             optimizer.step()
             if is_warmup:
                 scheduler.step()
@@ -381,14 +471,15 @@ for epoch in range(num_epochs + 1):
             correct += cc
         if accelerator.is_main_process and ct != 0:
             logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"], "train/vloss": vloss.item(),
-                       "train/ploss": ploss.item(), "train/loss": loss.item(), "train/acc": cc / ct}
+                       "train/ploss": ploss.item(), "train/loss": loss.item(), "train/acc": cc / ct,
+                       "train/next_token_loss": next_token_loss.item()}
             for id, i in enumerate(top_3acc):
                 logdict[f'train/top_{id + 1}_acc'] = topkacc[id].item() / ct
             wandb.log(logdict)
             # for id,i in enumerate(top_3acc):
             #     wandb.log({f'train/top_{id+1}_acc':topkacc[id].item()/ct})
 
-        del ploss, vloss
+        del ploss, vloss, next_token_loss
         epoch_loss += loss.item()
         num_batches += 1
 
@@ -417,17 +508,19 @@ for epoch in range(num_epochs + 1):
         for batch_idx, data in enumerate(tqdm(test_loader)):
             with torch.no_grad():
                 if batch_idx < 10:
-                    acces = getkacc(model, data, head, max_length=5)
+                    acces = getkacc(model, data, max_length=5)
                     for i in range(len(acces)):
                         k_acc[i].append(acces[i])
                 predict = model(data["hidden_states"], input_ids=data["input_ids"],
                                 attention_mask=data["attention_mask"])
-                target_head = head(data["target"])
+                target_head = teacher_head(data["target"])
                 target_p = nn.Softmax(dim=2)(target_head)
                 target_p = target_p.detach()
                 loss_mask = data["loss_mask"][:, :, None]
-                vloss, ploss, out_head = compute_loss(data["target"], target_p, predict, loss_mask)
+                vloss, ploss, out_head, next_token_loss = compute_loss(data["target"], target_p, predict, loss_mask, data["input_ids"])
                 loss = train_config["v_w"] * vloss + train_config["p_w"] * ploss
+                if args.add_next_token_loss == "yes":
+                    loss += train_config["next_token_w"] * next_token_loss
                 _, predicted = torch.max(out_head, 2)
                 _, target = torch.max(target_head, 2)
                 ct = loss_mask.sum().item()

@@ -21,5 +21,6 @@
   "use_cache": true,
   "vocab_size": 128256,
   "rope_theta": 500000.0,
+  "train_em_table": false,
   "bias": false
 }
