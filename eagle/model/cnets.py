@@ -507,9 +507,22 @@ class Model(nn.Module):
         # print("depth",depth)
         # print("top_k",top_k)
         # print("threshold",threshold)
+        e_f = config.expansion_factor
+
+        self.fc = nn.Linear(2 * config.hidden_size, e_f * config.hidden_size, bias=bias)
+
+        self.down_fc = nn.Linear(e_f * config.hidden_size, config.hidden_size, bias=bias)
+
+        config.hidden_size = e_f * config.hidden_size
+
+        config.intermediate_size = e_f * config.intermediate_size
 
         self.layers = nn.ModuleList([LlamaDecoderLayer(config, index) for index in range(config.num_hidden_layers)])
-        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=bias)
+
+        config.hidden_size = config.hidden_size // e_f
+
+        config.intermediate_size = config.intermediate_size // e_f
+
         self.act = ACT2FN[config.hidden_act]
         self.logsoftmax = nn.LogSoftmax(dim=-1)
         for param in self.embed_tokens.parameters():
@@ -653,6 +666,7 @@ class Model(nn.Module):
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
+        hidden_states = self.down_fc(hidden_states)
         if use_cache:
             return hidden_states, next_decoder_cache
 
